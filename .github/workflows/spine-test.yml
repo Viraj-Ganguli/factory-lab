@@ -1,0 +1,132 @@
+# Spine test (Phase 0 proof) -- DELETE AFTER VALIDATION
+#
+# One-off, manually-triggered workflow that proves the CI "spine" the real
+# orchestrator (.github/workflows/orchestrator.yml) depends on actually
+# works in this repo:
+#   - a postgres service container the app can connect to
+#   - npm run install:all / npm run migrate / npm test
+#   - anthropics/claude-code-action@v1 editing a file and committing
+#
+# Run it once via the Actions tab (workflow_dispatch), confirm:
+#   - the run is green
+#   - it pushed a commit to a new agent/spine-test-<run id> branch that adds
+#     a one-line comment to server/src/app.js
+#   - npm test ran (passes with "no tests found" -- that's expected, no test
+#     files exist yet)
+#
+# Then delete that branch and this file -- it is not part of the pipeline.
+
+name: Spine Test (delete after validation)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  DATABASE_URL: postgres://factorylab:factorylab@localhost:5432/factorylab
+  SESSION_SECRET: ci-spine-test-secret
+  NODE_ENV: test
+
+jobs:
+  spine:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: factorylab
+          POSTGRES_PASSWORD: factorylab
+          POSTGRES_DB: factorylab
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U factorylab -d factorylab"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Create scratch branch
+        env:
+          BRANCH: agent/spine-test-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+            client/package-lock.json
+
+      - name: Install dependencies
+        run: npm run install:all
+
+      - name: Run migrations
+        run: npm run migrate
+
+      - name: Resolve model
+        id: model
+        run: echo "model=$(jq -r '.model' .factory/orchestrator.config.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble prompt
+        id: prompt
+        run: |
+          set -euo pipefail
+          cat > /tmp/spine-prompt.md <<'EOF'
+          Add a single-line comment to the top of `server/src/app.js` (just
+          below any existing top-of-file comments) describing what the
+          module exports. Do not change anything else -- no other files, no
+          other lines.
+          EOF
+          DELIM="PROMPT_EOF_$(cat /proc/sys/kernel/random/uuid)"
+          {
+            echo "prompt<<$DELIM"
+            cat /tmp/spine-prompt.md
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          claude_args: >-
+            --model ${{ steps.model.outputs.model }}
+            --max-turns 3
+            --allowedTools "Read,Write,Edit,Bash(npm test*)"
+            --permission-mode acceptEdits
+
+      - name: Show diff
+        run: |
+          set -euo pipefail
+          git add -A
+          git diff --cached --stat
+          git diff --cached --name-only
+
+      - name: Run test suite
+        run: npm test
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          if git diff --cached --quiet; then
+            echo "Claude made no changes -- nothing to commit. Spine still considered green if the steps above succeeded."
+            exit 0
+          fi
+          git commit -m "chore: spine test -- Claude edit + green CI"
+          git push -u origin "$BRANCH"
+          echo "Pushed to branch $BRANCH -- delete it (and this workflow file) after confirming this run."

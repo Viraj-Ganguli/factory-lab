@@ -1,0 +1,77 @@
+{
+  "_comment": "DRAFT - starter content, revise me. Code-review rubric used to score a PR before the human gatekeeper checklist (.github/PULL_REQUEST_TEMPLATE/gatekeeper.md) is filled out. Weights must sum to 1.0. Each criterion is scored 0-100 by the reviewer/agent; a dimension's score is the average of its criteria scores; the overall score is the weighted sum of dimension scores.",
+  "version": "0.1.0",
+  "scale": {
+    "min": 0,
+    "max": 100,
+    "description": "Each criterion is scored 0-100. 100 = fully meets the criterion with no notable issues. 0 = criterion is violated or entirely unaddressed."
+  },
+  "passThreshold": 75,
+  "dimensions": [
+    {
+      "id": "security",
+      "label": "Security",
+      "weight": 0.4,
+      "criteria": [
+        {
+          "id": "security.authz",
+          "description": "Admin-only operations (create/update/delete events) are enforced server-side via requireAdmin, not just hidden in the UI."
+        },
+        {
+          "id": "security.input-validation",
+          "description": "All user-supplied input is validated and/or parameterized before use; no raw string interpolation into SQL."
+        },
+        {
+          "id": "security.session-handling",
+          "description": "Session/auth state is not leaked (e.g. password hashes never returned in API responses; cookies are httpOnly)."
+        },
+        {
+          "id": "security.dependency-risk",
+          "description": "No newly introduced dependency with known critical vulnerabilities or unnecessary broad permissions."
+        }
+      ]
+    },
+    {
+      "id": "architecture",
+      "label": "Architecture",
+      "weight": 0.35,
+      "criteria": [
+        {
+          "id": "architecture.layering",
+          "description": "Changes respect routes -> services -> data-access layering: routes contain no SQL or business rules, services contain no req/res, data-access contains only SQL."
+        },
+        {
+          "id": "architecture.scope",
+          "description": "Changes are scoped to what the issue's Acceptance Criteria require; no unrelated refactors bundled in."
+        },
+        {
+          "id": "architecture.test-isolation",
+          "description": "Application code changes do not modify or weaken tests/**, especially tests/golden/."
+        },
+        {
+          "id": "architecture.error-handling",
+          "description": "Errors use the existing error/middleware conventions (e.g. AppError subclasses, central error handler) rather than ad-hoc try/catch with inconsistent responses."
+        }
+      ]
+    },
+    {
+      "id": "style",
+      "label": "Style & Consistency",
+      "weight": 0.25,
+      "criteria": [
+        {
+          "id": "style.conventions",
+          "description": "New code matches existing naming, file organization, and formatting conventions in the surrounding module."
+        },
+        {
+          "id": "style.readability",
+          "description": "Code is reasonably commented where intent is non-obvious; no dead code or leftover debug statements."
+        },
+        {
+          "id": "style.test-tagging",
+          "description": "New tests follow the // AC-n tagging convention from .factory/qa.nlspec.md and live under the expected tests/ structure."
+        }
+      ]
+    }
+  ]
+}
