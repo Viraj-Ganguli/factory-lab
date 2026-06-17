@@ -232,9 +232,7 @@ jobs:
             echo
             echo "---"
             echo
-            echo "## tests/golden/ harness interface"
-            echo
-            cat tests/golden/README.md
+            echo "The shared test harness is at \`tests/golden/\` — read \`tests/golden/README.md\` for the full interface."
             echo
             echo "---"
             echo
