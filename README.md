@@ -158,6 +158,50 @@ the `workflow_dispatch` `model` input). The workflow never hardcodes or
 validates against a fixed model list — any valid Claude model id works with
 no edits to the YAML.
 
+### Model selection & rate limits
+
+`anthropics/claude-code-action@v1` makes internal Haiku API calls (~3K
+tokens/invocation) to drive its own tooling. These count against the same
+"Claude Haiku Active" rate-limit bucket as your main model calls. On a
+new/low-spend Anthropic account the hard limit is **10K input tokens/minute**
+per model family. Using Haiku as the `model` in config means both the
+action's internal calls and your 9K-token prompts compete for that same 10K
+bucket — practically guaranteed 429s before Claude touches a file.
+
+**Recommendation: use `claude-sonnet-4-6` as `model` on any new account.**
+Sonnet calls go into the "Claude Sonnet Active" bucket; the action's internal
+Haiku calls stay in the "Claude Haiku Active" bucket. Both stay under 10K/min
+independently.
+
+| Model | Works on new account | Approx. cost/run | Notes |
+| --- | --- | --- | --- |
+| `claude-sonnet-4-6` | ✅ yes | ~$0.05–0.35 | **Recommended default.** Fast, capable, separate rate bucket from action internals. |
+| `claude-opus-4-8` | ✅ yes | ~$0.50–2.00 | Best quality; use `stageModels` to apply only to the coder stage. |
+| `claude-haiku-4-5-20251001` | ⚠️ only if TPM ≥ 20K | ~$0.01–0.05 | Cheapest, but action's own Haiku overhead + your prompt exceeds the default 10K/min limit. |
+
+Cost per run is proportional to `coderMaxTurns` — that is the most token-heavy
+stage because it loops `npm test` → read → edit multiple times. Reducing
+`coderMaxTurns` from 8 to 5–6 is the single biggest cost lever.
+
+To use Haiku (or any model at lower cost) reliably, request a rate limit
+increase at [console.anthropic.com/settings/limits](https://console.anthropic.com/settings/limits).
+A Haiku limit of ≥ 20K input TPM is sufficient to clear the overhead.
+
+**Per-stage override example** — heavy model for coding, light model for QA
+and review:
+
+```json
+{
+  "model": "claude-haiku-4-5-20251001",
+  "stageModels": {
+    "coder": "claude-sonnet-4-6"
+  }
+}
+```
+
+**One-off model override** — no config edit needed; use the `workflow_dispatch`
+`model` input in the Actions tab to try a different model on a single run.
+
 ### One-time setup
 
 1. Add the `ANTHROPIC_API_KEY` repo secret: `gh secret set ANTHROPIC_API_KEY`.
@@ -193,3 +237,94 @@ agents' roles, allowed/forbidden paths, and workflow — these are the prompts
 the orchestrator feeds Claude. `.factory/rubric.json` defines the review bar;
 `.factory/ambiguity-checklist.md` is where agents record open questions
 instead of guessing. See the root `CLAUDE.md` for the full authority rules.
+
+---
+
+## Adapting factory-lab for your own project
+
+The pipeline (orchestrator workflow, agent NLSpecs, rubric, issue/PR
+templates) is fully portable. The app (`client/`, `server/`, `tests/golden/`,
+`CLAUDE.md`) is factory-lab-specific and gets replaced with your own project.
+
+### Quickest path — GitHub template
+
+factory-lab is configured as a GitHub Template Repository. Create a new repo
+from it in one command:
+
+```bash
+gh repo create my-project --template virajganguli/factory-lab --private
+cd my-project
+```
+
+This gives you a clean copy of everything with no git history. Then follow the
+customization checklist below.
+
+Alternatively, copy only the factory layer into an existing repo:
+
+```bash
+# Run from inside your existing project repo
+FACTORY=https://github.com/virajganguli/factory-lab
+
+# Copy the portable factory files
+gh repo clone virajganguli/factory-lab /tmp/factory-lab-src
+cp -r /tmp/factory-lab-src/.factory              .
+cp -r /tmp/factory-lab-src/.github/workflows/orchestrator.yml  .github/workflows/
+cp -r /tmp/factory-lab-src/.github/ISSUE_TEMPLATE .github/
+cp -r /tmp/factory-lab-src/.github/PULL_REQUEST_TEMPLATE .github/
+rm -rf /tmp/factory-lab-src
+```
+
+### What to keep vs. what to replace
+
+| Layer | Keep as-is | Replace / adapt |
+| --- | --- | --- |
+| `.github/workflows/orchestrator.yml` | ✅ keep | Only edit if your test command differs from `npm test` — change the two `npm test` invocations and the `npm run install:all` / `npm run migrate` setup steps. |
+| `.factory/orchestrator.config.json` | ✅ keep | Update `model`, `autoMerge`, turn limits to taste. |
+| `.factory/qa.nlspec.md` | ✅ keep structure | Update the **Allowed paths** / **Forbidden paths** sections for your repo layout, and the test-layer guidance (Supertest, pytest, etc.) for your stack. |
+| `.factory/coder.nlspec.md` | ✅ keep structure | Update **Allowed paths** and the step-3 layering bullet points (`routes→services→data-access` etc.) to match your app's architecture. |
+| `.factory/rubric.json` | ✅ keep | Adjust criterion weights/descriptions to match your quality bar. |
+| `.github/ISSUE_TEMPLATE/nlspec.md` | ✅ keep as-is | No changes needed. |
+| `.github/PULL_REQUEST_TEMPLATE/gatekeeper.md` | ✅ keep as-is | No changes needed. |
+| `CLAUDE.md` | 🔄 replace | Rewrite to describe your project's architecture, layering conventions, and the one hard rule: never touch `tests/golden/`. |
+| `tests/golden/` | 🔄 replace | Write a new shared test harness for your app (your framework's equivalent of `createTestApp()`, `resetDb()`, fixtures). This is the one human-authored bootstrap the QA agent imports. |
+| `client/`, `server/` | 🔄 replace | Your application source. |
+
+### Customization checklist
+
+After copying the factory files into your project:
+
+- [ ] **Rewrite `CLAUDE.md`** — describe your project's layering, conventions,
+  and the `tests/golden/` immutability rule. The agents use this as their
+  primary style guide.
+- [ ] **Update path lists in the NLSpecs** — `qa.nlspec.md` lists what the QA
+  agent may write (`tests/**`); `coder.nlspec.md` lists what the coder may
+  touch (`client/**`, `server/**`, or equivalent for your stack). Edit both to
+  reflect your repo layout.
+- [ ] **Update the test layer guidance** — the QA NLSpec references Supertest
+  and the Express `app` export. Replace with your framework's integration-test
+  idiom (e.g. pytest + httpx for FastAPI, RSpec + rack-test for Rails).
+- [ ] **Write `tests/golden/`** — at minimum: a test-app factory, a DB reset
+  helper, and a fixtures file. This is the shared harness every QA-generated
+  suite will import.
+- [ ] **Adapt the orchestrator workflow** — if your test command isn't
+  `npm test`, find the two `npm test` invocations and the
+  `npm run install:all` / `npm run migrate` lines and replace them. The
+  Postgres service container block can be removed entirely for non-Postgres
+  projects.
+- [ ] **One-time setup** (same as factory-lab's): add `ANTHROPIC_API_KEY`
+  secret, create the `build` label, enable read/write workflow permissions.
+
+### Non-Node stacks
+
+The orchestrator is language-agnostic — it just runs shell commands in a
+Linux runner. Typical substitutions:
+
+| factory-lab (Node/Express/Postgres) | Python/FastAPI/Postgres | Ruby/Rails |
+| --- | --- | --- |
+| `npm run install:all` | `pip install -r requirements.txt` | `bundle install` |
+| `npm run migrate` | `alembic upgrade head` | `rails db:migrate` |
+| `npm test` | `pytest` | `rails test` or `rspec` |
+| `postgres:16-alpine` service | same | same |
+
+Everything else (branch management, git path enforcement, review scoring,
+PR creation) is identical regardless of stack.
