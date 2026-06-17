@@ -243,6 +243,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          show_full_output: "true"
           prompt: ${{ steps.prompt.outputs.prompt }}
           claude_args: >-
             --model ${{ steps.model.outputs.model }}
@@ -399,6 +400,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          show_full_output: "true"
           prompt: ${{ steps.prompt.outputs.prompt }}
           claude_args: >-
             --model ${{ steps.model.outputs.model }}
@@ -609,6 +611,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          show_full_output: "true"
           prompt: ${{ steps.prompt.outputs.prompt }}
           claude_args: >-
             --model ${{ steps.model.outputs.model }}
@@ -752,6 +755,7 @@ jobs:
       - name: Comment failure on issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
