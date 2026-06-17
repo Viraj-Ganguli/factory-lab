@@ -9,6 +9,9 @@ function validateEventInput({ title, startsAt }, { partial = false } = {}) {
     if (!title || !String(title).trim()) {
       throw new ValidationError('title is required');
     }
+    if (String(title).trim().length > 200) {
+      throw new ValidationError('title must not exceed 200 characters');
+    }
   }
 
   if (!partial || startsAt !== undefined) {
