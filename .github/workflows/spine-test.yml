@@ -107,7 +107,7 @@ jobs:
           prompt: ${{ steps.prompt.outputs.prompt }}
           claude_args: >-
             --model ${{ steps.model.outputs.model }}
-            --max-turns 3
+            --max-turns 5
             --allowedTools "Read,Write,Edit,Bash(npm test*)"
             --permission-mode acceptEdits
 
