@@ -235,6 +235,15 @@ jobs:
             echo "## tests/golden/ harness interface"
             echo
             cat tests/golden/README.md
+            echo
+            echo "---"
+            echo
+            echo "## Action required"
+            echo
+            echo "Write the failing tests for issue #$ISSUE_NUMBER right now."
+            echo "Use your Write or Edit tools to create test file(s) under \`tests/<feature>/\`."
+            echo "Do NOT describe what you will do — call the tools and write the files."
+            echo "When done, run \`npm test\` to confirm the new tests fail for the right reason."
             echo "$DELIM"
           } >> "$GITHUB_OUTPUT"
 
@@ -391,7 +400,14 @@ jobs:
             echo
             echo "## Failing tests"
             echo
-            echo 'The QA agent already committed failing tests under tests/**. Run \`npm test\` to see the current failures, then iterate (read -> edit -> re-run) until it exits 0. Do not edit anything under tests/**.'
+            echo 'The QA agent already committed failing tests under tests/**. Run `npm test` to see the current failures, then iterate (read -> edit -> re-run) until it exits 0. Do not edit anything under tests/**.'
+            echo
+            echo "---"
+            echo
+            echo "## Action required"
+            echo
+            echo "Start now: run \`npm test\`, read the failures, edit the application source, and repeat until green."
+            echo "Do NOT describe what you will do — call the tools and fix the code."
             echo "$DELIM"
           } >> "$GITHUB_OUTPUT"
 
