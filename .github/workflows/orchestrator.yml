@@ -37,6 +37,7 @@ env:
   DATABASE_URL: postgres://factorylab:factorylab@localhost:5432/factorylab
   SESSION_SECRET: ci-orchestrator-secret
   NODE_ENV: test
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # ---------------------------------------------------------------------
