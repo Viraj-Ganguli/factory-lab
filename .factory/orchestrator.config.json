@@ -1,0 +1,14 @@
+{
+  "_comment": "Config for .github/workflows/orchestrator.yml. Human-maintained — agents (per coder.nlspec.md / qa.nlspec.md) are forbidden from editing .factory/**, so this file is a safe place for orchestrator-only tuning.",
+
+  "label": "build",
+
+  "autoMerge": false,
+
+  "coderMaxTurns": 12,
+  "qaMaxTurns": 8,
+  "reviewMaxTurns": 6,
+
+  "model": "claude-sonnet-4-6",
+  "stageModels": {}
+}

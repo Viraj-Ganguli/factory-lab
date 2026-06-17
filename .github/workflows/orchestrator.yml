@@ -1,0 +1,756 @@
+# Agent Orchestrator
+#
+# Drives a human-filed NLSpec issue (.github/ISSUE_TEMPLATE/nlspec.md) through
+# QA -> Coder -> Review -> PR using Claude Code in CI.
+#
+# Trigger: a repo collaborator applies the configured label (see
+# .factory/orchestrator.config.json, default "build") to an NLSpec issue, or a
+# maintainer manually dispatches this workflow for a given issue number.
+#
+# Tuning (model, max-turns, autoMerge, the trigger label) lives in
+# .factory/orchestrator.config.json, not in this file. See README.md for the
+# one-time setup (ANTHROPIC_API_KEY secret, the "build" label, workflow
+# permissions) and how to trigger/configure a run.
+
+name: Agent Orchestrator
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "NLSpec issue number to build"
+        required: true
+        type: number
+      model:
+        description: "Override the Claude model for every stage of this run (e.g. claude-opus-4-8). Leave empty to use .factory/orchestrator.config.json."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  DATABASE_URL: postgres://factorylab:factorylab@localhost:5432/factorylab
+  SESSION_SECRET: ci-orchestrator-secret
+  NODE_ENV: test
+
+jobs:
+  # ---------------------------------------------------------------------
+  # guard: decide whether this event should start a build, and for which
+  # issue. Reads the trigger label from .factory/orchestrator.config.json
+  # and (for label events) checks the labeling user is a collaborator.
+  # ---------------------------------------------------------------------
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      issue_number: ${{ steps.check.outputs.issue_number }}
+      model_override: ${{ steps.check.outputs.model_override }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Evaluate trigger
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_LABEL: ${{ github.event.label.name }}
+          EVENT_SENDER: ${{ github.event.sender.login }}
+          EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          DISPATCH_ISSUE_NUMBER: ${{ inputs.issue_number }}
+          DISPATCH_MODEL: ${{ inputs.model }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          CONFIG_LABEL=$(jq -r '.label' .factory/orchestrator.config.json)
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Manually dispatched for issue #$DISPATCH_ISSUE_NUMBER."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "issue_number=$DISPATCH_ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+            echo "model_override=$DISPATCH_MODEL" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$EVENT_LABEL" != "$CONFIG_LABEL" ]; then
+            echo "Label '$EVENT_LABEL' is not the configured build label ('$CONFIG_LABEL'); skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if gh api "repos/$REPO/collaborators/$EVENT_SENDER" --silent; then
+            echo "$EVENT_SENDER is a collaborator; proceeding."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "issue_number=$EVENT_ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+            echo "model_override=" >> "$GITHUB_OUTPUT"
+          else
+            echo "$EVENT_SENDER is not a collaborator; skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------
+  # setup: create (or reuse) the per-issue feature branch and announce the
+  # run on the issue.
+  # ---------------------------------------------------------------------
+  setup:
+    needs: [guard]
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.branch.outputs.branch }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Derive branch name
+        id: branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          TITLE=$(gh issue view "$ISSUE_NUMBER" --json title --jq .title)
+          SLUG=$(echo "$TITLE" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed -E 's/\[nlspec\]//g; s/[^a-z0-9]+/-/g; s/^-+|-+$//g' \
+            | cut -c1-40)
+          SLUG=${SLUG:-issue}
+          BRANCH="agent/issue-${ISSUE_NUMBER}-${SLUG}"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Create or reuse feature branch
+        env:
+          BRANCH: ${{ steps.branch.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Branch $BRANCH already exists on origin; reusing it."
+          else
+            git checkout -b "$BRANCH"
+            git push -u origin "$BRANCH"
+          fi
+
+      - name: Announce build start on issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh issue comment "$ISSUE_NUMBER" --body "Build started on branch \`$BRANCH\`. [Follow the run]($RUN_URL)."
+
+  # ---------------------------------------------------------------------
+  # qa: Claude writes failing tests under tests/** for the issue's
+  # Acceptance Criteria, using tests/golden/ as the shared harness.
+  # ---------------------------------------------------------------------
+  qa:
+    needs: [guard, setup]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: factorylab
+          POSTGRES_PASSWORD: factorylab
+          POSTGRES_DB: factorylab
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U factorylab -d factorylab"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.branch }}
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+            client/package-lock.json
+
+      - name: Install dependencies
+        run: npm run install:all
+
+      - name: Run migrations
+        run: npm run migrate
+
+      - name: Resolve model
+        id: model
+        env:
+          OVERRIDE: ${{ needs.guard.outputs.model_override }}
+        run: |
+          set -euo pipefail
+          if [ -n "$OVERRIDE" ]; then
+            MODEL="$OVERRIDE"
+          else
+            MODEL=$(jq -r '.stageModels.qa // .model' .factory/orchestrator.config.json)
+          fi
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve max turns
+        id: turns
+        run: echo "max_turns=$(jq -r '.qaMaxTurns' .factory/orchestrator.config.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble QA prompt
+        id: prompt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          DELIM="PROMPT_EOF_$(cat /proc/sys/kernel/random/uuid)"
+          {
+            echo "prompt<<$DELIM"
+            cat .factory/qa.nlspec.md
+            echo
+            echo "---"
+            echo
+            echo "## GitHub issue #$ISSUE_NUMBER"
+            echo
+            gh issue view "$ISSUE_NUMBER" --json title,body --jq '"# " + .title + "\n\n" + .body'
+            echo
+            echo "---"
+            echo
+            echo "## tests/golden/ harness interface"
+            echo
+            cat tests/golden/README.md
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run QA agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          claude_args: >-
+            --model ${{ steps.model.outputs.model }}
+            --max-turns ${{ steps.turns.outputs.max_turns }}
+            --allowedTools "Read,Write,Edit,Glob,Grep,Bash(npm test*),Bash(git status*),Bash(git diff*),Bash(git log*)"
+            --permission-mode acceptEdits
+
+      - name: Stage QA agent changes
+        run: git add -A
+
+      - name: Enforce QA path allowlist
+        run: |
+          set -euo pipefail
+          CHANGED=$(git diff --name-only --cached HEAD)
+          if [ -z "$CHANGED" ]; then
+            echo "QA agent made no changes."
+            exit 1
+          fi
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          BAD=""
+          while IFS= read -r f; do
+            case "$f" in
+              tests/golden/*) BAD="$BAD$f " ;;
+              tests/*) ;;
+              .github/workflows/*) ;;
+              *) BAD="$BAD$f " ;;
+            esac
+          done <<< "$CHANGED"
+
+          if [ -n "$BAD" ]; then
+            echo "QA agent touched disallowed paths: $BAD"
+            exit 1
+          fi
+
+      - name: Run test suite (expect red)
+        run: |
+          set +e
+          npm test
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -eq 0 ]; then
+            echo "Test suite is green before the coder agent has run -- QA tests aren't red."
+            exit 1
+          fi
+          echo "Test suite is red as expected (exit $STATUS)."
+
+      - name: Commit and push QA tests
+        env:
+          ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "test: add failing tests for issue #$ISSUE_NUMBER (QA agent)"
+          git push
+
+      - name: Label issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
+        run: gh issue edit "$ISSUE_NUMBER" --add-label "agent:qa-done"
+
+  # ---------------------------------------------------------------------
+  # coder: Claude edits client/** and server/** until the QA agent's tests
+  # (and the rest of the suite) pass.
+  # ---------------------------------------------------------------------
+  coder:
+    needs: [guard, setup, qa]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: factorylab
+          POSTGRES_PASSWORD: factorylab
+          POSTGRES_DB: factorylab
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U factorylab -d factorylab"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.branch }}
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+            client/package-lock.json
+
+      - name: Install dependencies
+        run: npm run install:all
+
+      - name: Run migrations
+        run: npm run migrate
+
+      - name: Resolve model
+        id: model
+        env:
+          OVERRIDE: ${{ needs.guard.outputs.model_override }}
+        run: |
+          set -euo pipefail
+          if [ -n "$OVERRIDE" ]; then
+            MODEL="$OVERRIDE"
+          else
+            MODEL=$(jq -r '.stageModels.coder // .model' .factory/orchestrator.config.json)
+          fi
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve max turns
+        id: turns
+        run: echo "max_turns=$(jq -r '.coderMaxTurns' .factory/orchestrator.config.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble coder prompt
+        id: prompt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          DELIM="PROMPT_EOF_$(cat /proc/sys/kernel/random/uuid)"
+          {
+            echo "prompt<<$DELIM"
+            cat .factory/coder.nlspec.md
+            echo
+            echo "---"
+            echo
+            echo "## GitHub issue #$ISSUE_NUMBER"
+            echo
+            gh issue view "$ISSUE_NUMBER" --json title,body --jq '"# " + .title + "\n\n" + .body'
+            echo
+            echo "---"
+            echo
+            echo "## Failing tests"
+            echo
+            echo 'The QA agent already committed failing tests under tests/**. Run \`npm test\` to see the current failures, then iterate (read -> edit -> re-run) until it exits 0. Do not edit anything under tests/**.'
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run coder agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          claude_args: >-
+            --model ${{ steps.model.outputs.model }}
+            --max-turns ${{ steps.turns.outputs.max_turns }}
+            --allowedTools "Read,Write,Edit,Glob,Grep,Bash(npm test*),Bash(git status*),Bash(git diff*),Bash(git log*)"
+            --permission-mode acceptEdits
+
+      - name: Stage coder agent changes
+        run: git add -A
+
+      - name: Enforce coder path allowlist
+        run: |
+          set -euo pipefail
+          CHANGED=$(git diff --name-only --cached HEAD)
+          if [ -z "$CHANGED" ]; then
+            echo "Coder agent made no changes."
+            exit 1
+          fi
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          BAD=""
+          while IFS= read -r f; do
+            case "$f" in
+              client/*) ;;
+              server/*) ;;
+              *) BAD="$BAD$f " ;;
+            esac
+          done <<< "$CHANGED"
+
+          if [ -n "$BAD" ]; then
+            echo "Coder agent touched disallowed paths: $BAD"
+            exit 1
+          fi
+
+      - name: Run test suite (must be green)
+        run: npm test
+
+      - name: Commit and push coder changes
+        env:
+          ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "feat: implement issue #$ISSUE_NUMBER (coder agent)"
+          git push
+
+      - name: Label issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
+        run: gh issue edit "$ISSUE_NUMBER" --add-label "agent:coder-done"
+
+  # ---------------------------------------------------------------------
+  # review: Claude scores the cumulative diff against .factory/rubric.json.
+  # score-rubric.js computes the weighted pass/fail deterministically.
+  # ---------------------------------------------------------------------
+  review:
+    needs: [guard, setup, qa, coder]
+    runs-on: ubuntu-latest
+    outputs:
+      overall: ${{ steps.score.outputs.overall }}
+      pass: ${{ steps.score.outputs.pass }}
+      dim_security: ${{ steps.score.outputs.dim_security }}
+      dim_architecture: ${{ steps.score.outputs.dim_architecture }}
+      dim_style: ${{ steps.score.outputs.dim_style }}
+      report_b64: ${{ steps.score.outputs.report_b64 }}
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: factorylab
+          POSTGRES_PASSWORD: factorylab
+          POSTGRES_DB: factorylab
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U factorylab -d factorylab"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.branch }}
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+            client/package-lock.json
+
+      - name: Install dependencies
+        run: npm run install:all
+
+      - name: Run migrations
+        run: npm run migrate
+
+      - name: Re-run full test suite
+        run: npm test
+
+      - name: Compute cumulative diff vs main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git diff --name-only origin/main...HEAD > /tmp/changed-files.txt
+          git diff origin/main...HEAD > /tmp/full-diff.txt
+          echo "Changed files since main:"
+          cat /tmp/changed-files.txt
+
+          while IFS= read -r f; do
+            case "$f" in
+              tests/golden/*)
+                echo "tests/golden/** was modified (file: $f) -- failing the review job."
+                exit 1
+                ;;
+            esac
+          done < /tmp/changed-files.txt
+
+      - name: Resolve model
+        id: model
+        env:
+          OVERRIDE: ${{ needs.guard.outputs.model_override }}
+        run: |
+          set -euo pipefail
+          if [ -n "$OVERRIDE" ]; then
+            MODEL="$OVERRIDE"
+          else
+            MODEL=$(jq -r '.stageModels.review // .model' .factory/orchestrator.config.json)
+          fi
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve max turns
+        id: turns
+        run: echo "max_turns=$(jq -r '.reviewMaxTurns' .factory/orchestrator.config.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble review prompt
+        id: prompt
+        env:
+          ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          {
+            echo "# Review agent"
+            echo
+            echo "Score the cumulative diff for issue #$ISSUE_NUMBER (changes since"
+            echo "main, listed and shown below) against every criterion in the rubric"
+            echo "below. For each criterion, give a 0-100 score and a one-sentence"
+            echo "comment justifying it."
+            echo
+            echo "When done, write your results to \`.factory/review-result.json\`"
+            echo "(create it -- it does not exist yet) with exactly this shape:"
+            echo
+            echo '```json'
+            echo '{'
+            echo '  "criteria": {'
+            echo '    "<criterion-id>": { "score": 0-100, "comment": "..." },'
+            echo '    "...": { "score": 0-100, "comment": "..." }'
+            echo '  }'
+            echo '}'
+            echo '```'
+            echo
+            echo "Include every criterion id from the rubric's dimensions[].criteria[].id."
+            echo "Do not create, edit, or delete any other file -- in particular, never"
+            echo "modify anything under tests/**, including tests/golden/**."
+            echo
+            echo "---"
+            echo
+            echo "## Rubric (.factory/rubric.json)"
+            echo
+            echo '```json'
+            cat .factory/rubric.json
+            echo '```'
+            echo
+            echo "---"
+            echo
+            echo "## Changed files (vs main)"
+            echo
+            echo '```'
+            cat /tmp/changed-files.txt
+            echo '```'
+            echo
+            echo "---"
+            echo
+            echo "## Full diff (vs main)"
+            echo
+            echo '```diff'
+            cat /tmp/full-diff.txt
+            echo '```'
+          } > /tmp/review-prompt.md
+
+          DELIM="PROMPT_EOF_$(cat /proc/sys/kernel/random/uuid)"
+          {
+            echo "prompt<<$DELIM"
+            cat /tmp/review-prompt.md
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run review agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          claude_args: >-
+            --model ${{ steps.model.outputs.model }}
+            --max-turns ${{ steps.turns.outputs.max_turns }}
+            --allowedTools "Read,Glob,Grep,Bash(git diff*),Bash(git log*),Bash(npm test*),Write(.factory/review-result.json)"
+            --permission-mode acceptEdits
+
+      - name: Enforce review write-scope
+        run: |
+          set -euo pipefail
+          CHANGED=$(git status --porcelain)
+          if [ -n "$CHANGED" ]; then
+            echo "Review agent modified tracked files (it should only write the gitignored .factory/review-result.json):"
+            echo "$CHANGED"
+            exit 1
+          fi
+          if [ ! -f .factory/review-result.json ]; then
+            echo "Review agent did not write .factory/review-result.json."
+            exit 1
+          fi
+
+      - name: Score rubric
+        id: score
+        run: |
+          set -euo pipefail
+          node .factory/scripts/score-rubric.js \
+            .factory/rubric.json .factory/review-result.json .factory/review-score.json \
+            > /tmp/review-report.md
+
+          OVERALL=$(jq -r '.overall' .factory/review-score.json)
+          PASS=$(jq -r '.pass' .factory/review-score.json)
+          DIM_SECURITY=$(jq -r '.dimensions.security // 0' .factory/review-score.json)
+          DIM_ARCH=$(jq -r '.dimensions.architecture // 0' .factory/review-score.json)
+          DIM_STYLE=$(jq -r '.dimensions.style // 0' .factory/review-score.json)
+
+          echo "overall=$OVERALL" >> "$GITHUB_OUTPUT"
+          echo "pass=$PASS" >> "$GITHUB_OUTPUT"
+          echo "dim_security=$DIM_SECURITY" >> "$GITHUB_OUTPUT"
+          echo "dim_architecture=$DIM_ARCH" >> "$GITHUB_OUTPUT"
+          echo "dim_style=$DIM_STYLE" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "report_b64<<REPORT_EOF"
+            base64 < /tmp/review-report.md | tr -d '\n'
+            echo
+            echo "REPORT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
+        run: gh issue comment "$ISSUE_NUMBER" --body-file /tmp/review-report.md
+
+      - name: Label issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
+        run: gh issue edit "$ISSUE_NUMBER" --add-label "agent:review-done"
+
+  # ---------------------------------------------------------------------
+  # pr: open the gatekeeper PR with the rubric score injected, and either
+  # leave it for human review or auto-merge per .factory/orchestrator.config.json.
+  # ---------------------------------------------------------------------
+  pr:
+    needs: [guard, setup, qa, coder, review]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.branch }}
+          fetch-depth: 0
+
+      - name: Build PR body
+        env:
+          ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
+          OVERALL: ${{ needs.review.outputs.overall }}
+          DIM_SECURITY: ${{ needs.review.outputs.dim_security }}
+          DIM_ARCH: ${{ needs.review.outputs.dim_architecture }}
+          DIM_STYLE: ${{ needs.review.outputs.dim_style }}
+          REPORT_B64: ${{ needs.review.outputs.report_b64 }}
+        run: |
+          set -euo pipefail
+          echo "$REPORT_B64" | base64 -d > /tmp/review-report.md
+
+          {
+            sed -E \
+              -e "s/^Linked issue: #\$/Linked issue: #${ISSUE_NUMBER}/" \
+              -e "s/^Score: ___.*/Score: ${OVERALL} \/ 100 -- Security: ${DIM_SECURITY} Architecture: ${DIM_ARCH} Style: ${DIM_STYLE}/" \
+              .github/PULL_REQUEST_TEMPLATE/gatekeeper.md
+            echo
+            echo "---"
+            echo
+            cat /tmp/review-report.md
+            echo
+            echo "Closes #${ISSUE_NUMBER}"
+          } > /tmp/pr-body.md
+
+      - name: Create pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
+          BRANCH: ${{ needs.setup.outputs.branch }}
+        run: |
+          set -euo pipefail
+          TITLE=$(gh issue view "$ISSUE_NUMBER" --json title,number \
+            --jq '"[Agent] " + .title + " (#" + (.number|tostring) + ")"')
+          URL=$(gh pr create --title "$TITLE" --body-file /tmp/pr-body.md --base main --head "$BRANCH")
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "number=$(basename "$URL")" >> "$GITHUB_OUTPUT"
+
+      - name: Merge gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REVIEW_PASS: ${{ needs.review.outputs.pass }}
+        run: |
+          set -euo pipefail
+          AUTO_MERGE=$(jq -r '.autoMerge' .factory/orchestrator.config.json)
+
+          if [ "$AUTO_MERGE" = "true" ] && [ "$REVIEW_PASS" = "true" ]; then
+            gh pr merge "$PR_NUMBER" --squash --delete-branch
+            gh issue edit "$ISSUE_NUMBER" --add-label "agent:merged"
+          else
+            gh pr comment "$PR_NUMBER" --body "Build complete. Awaiting human gatekeeper review per the PR template (autoMerge=$AUTO_MERGE, rubric pass=$REVIEW_PASS)."
+            gh issue edit "$ISSUE_NUMBER" --add-label "agent:pr-open"
+          fi
+
+  # ---------------------------------------------------------------------
+  # report-failure: if any agent/enforcement job failed, leave a comment on
+  # the issue so a human doesn't have to dig through the Actions tab.
+  # ---------------------------------------------------------------------
+  report-failure:
+    needs: [guard, setup, qa, coder, review, pr]
+    if: failure() && needs.guard.outputs.issue_number != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment failure on issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.guard.outputs.issue_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh issue comment "$ISSUE_NUMBER" --body "Build pipeline failed. See the [workflow run]($RUN_URL) for details. No PR was opened."
+          gh issue edit "$ISSUE_NUMBER" --add-label "agent:failed"
