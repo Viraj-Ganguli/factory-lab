@@ -7,7 +7,7 @@
 
   "coderMaxTurns": 12,
   "qaMaxTurns": 8,
-  "reviewMaxTurns": 6,
+  "reviewMaxTurns": 10,
 
   "model": "claude-sonnet-4-6",
   "stageModels": {}

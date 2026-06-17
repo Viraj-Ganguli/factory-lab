@@ -616,7 +616,7 @@ jobs:
           claude_args: >-
             --model ${{ steps.model.outputs.model }}
             --max-turns ${{ steps.turns.outputs.max_turns }}
-            --allowedTools "Read,Glob,Grep,Bash(git diff*),Bash(git log*),Bash(npm test*),Write(.factory/review-result.json)"
+            --allowedTools "Read,Write,Glob,Grep,Bash(git diff*),Bash(git log*),Bash(npm test*)"
             --permission-mode acceptEdits
 
       - name: Enforce review write-scope
